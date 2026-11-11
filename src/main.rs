@@ -1,3 +1,4 @@
+#[allow(dead_code)] mod terminal;
 mod target;
 
 use gpui_kit::component::{

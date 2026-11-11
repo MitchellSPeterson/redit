@@ -60,7 +60,7 @@ impl Target {
         PathBuf::from(root).join(rel)
     }
 
-    fn ssh_command(host: &str, root: &str, script: &str) -> Command {
+    fn ssh_command(host: &str, root: &str, script: &str, tty: bool) -> Command {
         let script = format!("cd {} && {script}", sh_quote(root));
         let mut c = Command::new("ssh");
         c.args([
@@ -69,14 +69,29 @@ impl Target {
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=4",
         ]);
+        if tty {
+            c.arg("-tt");
+        }
         // Win32-OpenSSH has no connection multiplexing.
         #[cfg(unix)]
         c.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"])
             .arg("-o")
-            .arg(format!("ControlPath={}", std::env::temp_dir().join("redit-ssh-%C").display()));
+            .arg("ControlPath=/tmp/redit-ssh-%C"); // macOS temp_dir() overflows the 104-byte unix socket path
         // Remote login shell may be fish/nu: force sh.
         c.arg(host).arg(format!("sh -c {}", sh_quote(&script)));
         c
+    }
+
+    /// Interactive login shell in root, for a pty (local: $SHELL in root; ssh: `ssh -tt`).
+    pub fn shell(&self) -> Command {
+        match self {
+            Target::Local { root } => {
+                let mut c = Command::new(std::env::var("SHELL").unwrap_or_else(|_| "sh".into()));
+                c.arg("-l").current_dir(root);
+                c
+            }
+            Target::Ssh { host, root } => Self::ssh_command(host, root, "exec \"${SHELL:-sh}\" -l", true),
+        }
     }
 
     /// Spawn, feed stdin, return stdout (or stderr as the error).
@@ -106,7 +121,7 @@ impl Target {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(500 * attempt));
             }
-            match Self::exec(Self::ssh_command(host, root, script), stdin) {
+            match Self::exec(Self::ssh_command(host, root, script, false), stdin) {
                 Ok(out) => return Ok(out),
                 Err((code, err)) => {
                     last = err;
