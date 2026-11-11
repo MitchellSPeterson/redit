@@ -5155,7 +5155,11 @@ dependencies = [
 name = "redit"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui-kit",
+ "lsp-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

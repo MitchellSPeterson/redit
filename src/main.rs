@@ -1,3 +1,4 @@
+mod lsp;
 mod panels;
 mod target;
 
@@ -28,6 +29,7 @@ struct Tab {
 
 struct Redit {
     target: Target,
+    lsp: lsp::LspHandle,
     gen_: u64, // bumped on target switch; stale results are dropped
     busy: usize,
     msg: String,
@@ -98,6 +100,7 @@ impl Redit {
         .detach();
         let mut s = Self {
             target: Target::parse(&arg),
+            lsp: lsp::LspHandle::new(Target::parse(&arg)),
             gen_: 0,
             busy: 0,
             msg: String::new(),
@@ -157,6 +160,7 @@ impl Redit {
     fn open_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let s = self.target_input.read(cx).value().to_string();
         self.target = Target::parse(s.trim());
+        self.lsp = lsp::LspHandle::new(self.target.clone()); // old servers shut down on drop
         self.gen_ += 1;
         self.dirs.clear();
         self.expanded.clear();
@@ -246,8 +250,21 @@ impl Redit {
                 Ok((text, mtime)) => {
                     let title = rel.rsplit('/').next().unwrap_or(&rel).to_string();
                     let ext = rel.rsplit_once('.').map(|x| x.1).unwrap_or("text").to_string();
-                    this.new_tab(rel, title, text, false, ext, mtime, w, cx);
-                    // TODO(lsp): attach the language server for `this.tabs[this.active]` here.
+                    this.new_tab(rel.clone(), title, text, false, ext, mtime, w, cx);
+                    let me = cx.entity().downgrade();
+                    let me2 = me.clone();
+                    let open: lsp::OpenFn = std::rc::Rc::new(move |rel, range, w, app| {
+                        let rel = rel.to_string();
+                        let _ = me.update(app, |this, cx| this.open_file(rel, Some(range.start.line), w, cx));
+                    });
+                    let on_err = move |e: String, app: &mut App| {
+                        let _ = me2.update(app, |this, cx| {
+                            this.set_msg(format!("lsp: {e}"));
+                            cx.notify();
+                        });
+                    };
+                    // Err = no server for this extension: plain editor.
+                    let _ = lsp::attach(&this.tabs[this.active].state, &this.lsp, &rel, open, on_err, cx);
                     this.goto_line(this.active, line, w, cx);
                 }
                 Err(e) => this.set_msg(format!("error: open {rel}: {e}")),
@@ -283,7 +300,12 @@ impl Redit {
         }
         let (key, text) = (tab.key.clone(), tab.state.read(cx).text().to_string());
         let (k, t2) = (key.clone(), text.clone());
-        let job = move |t: Target| t.write(&k, &t2).map(|_| t.mtimes(&[k]).ok().and_then(|m| m[0]));
+        let lsp = self.lsp.clone();
+        let job = move |t: Target| {
+            t.write(&k, &t2)?;
+            lsp.did_save(&k);
+            Ok::<_, String>(t.mtimes(&[k]).ok().and_then(|m| m[0]))
+        };
         self.bg(window, cx, job, move |this, res, w, cx| match res {
             Ok(mtime) => {
                 if let Some(t) = this.tabs.iter_mut().find(|t| t.key == key) {
