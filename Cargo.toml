@@ -1,0 +1,12 @@
+[package]
+name = "redit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = { version = "0.9.1", features = ["syntect"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
