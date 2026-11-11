@@ -1,16 +1,19 @@
+mod panels;
 mod target;
 
 use gpui_kit::component::{
     ActiveTheme, Disableable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Editor, EditorState, Input, InputEvent, InputState},
+    input::{Editor, EditorState, Input, InputEvent, InputState, Position},
+    select::{Select, SelectEvent, SelectState},
 };
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::collections::{HashMap, HashSet};
-use target::{Entry, Target};
+use std::time::Duration;
+use target::{Entry, Forward, SearchHit, Target};
 
-actions!(redit, [Save]);
+actions!(redit, [Save, FocusSearch, ToggleBottom]);
 
 struct Tab {
     key: String, // path, or "diff: path"
@@ -19,6 +22,7 @@ struct Tab {
     saved: String,
     dirty: bool,
     readonly: bool,
+    mtime: Option<i64>,
     _sub: Subscription,
 }
 
@@ -36,6 +40,16 @@ struct Redit {
     active: usize,
     branch: Option<String>,
     status: Vec<(String, String)>,
+    search_mode: bool,
+    search_input: Entity<InputState>,
+    hits: Vec<SearchHit>,
+    polling: bool,
+    host_select: Entity<SelectState<Vec<String>>>,
+    port_input: Entity<InputState>,
+    forwards: Vec<Forward>,
+    bottom_open: bool,
+    /// Slot for the terminal: set to `Some(entity.into())` and it renders in the bottom panel.
+    bottom: Option<AnyView>,
 }
 
 fn join(parent: &str, name: &str) -> String {
@@ -53,6 +67,35 @@ impl Redit {
         })
         .detach();
         let commit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search in files"));
+        cx.subscribe_in(&search_input, window, |this, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = ev {
+                this.run_search(window, cx);
+            }
+        })
+        .detach();
+        let port_input = cx.new(|cx| InputState::new(window, cx).placeholder("port or local:remote"));
+        let host_select = cx.new(|cx| SelectState::new(target::ssh_hosts(), None, window, cx));
+        cx.subscribe_in(&host_select, window, |this, _, ev: &SelectEvent<Vec<String>>, window, cx| {
+            if let SelectEvent::Confirm(Some(h)) = ev {
+                let v = format!("{h}:");
+                this.target_input.update(cx, |s, cx| {
+                    s.set_value(v, window, cx);
+                    s.focus(window, cx);
+                });
+            }
+        })
+        .detach();
+        // File watching: poll every 3s; the loop ends when the view is dropped.
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                if this.update_in(cx, |this, w, cx| this.tick(w, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let mut s = Self {
             target: Target::parse(&arg),
             gen_: 0,
@@ -67,6 +110,15 @@ impl Redit {
             active: 0,
             branch: None,
             status: vec![],
+            search_mode: false,
+            search_input,
+            hits: vec![],
+            polling: false,
+            host_select,
+            port_input,
+            forwards: vec![],
+            bottom_open: false,
+            bottom: None,
         };
         s.reload(window, cx);
         s
@@ -110,6 +162,8 @@ impl Redit {
         self.expanded.clear();
         self.tabs.clear();
         self.active = 0;
+        self.hits.clear();
+        self.stop_forwards(cx);
         self.reload(window, cx);
     }
 
@@ -149,6 +203,7 @@ impl Redit {
         text: String,
         readonly: bool,
         lang: String,
+        mtime: Option<i64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -171,24 +226,39 @@ impl Redit {
                 cx.notify();
             }
         });
-        self.tabs.push(Tab { key, title, state, saved: text, dirty: false, readonly, _sub: sub });
+        self.tabs.push(Tab { key, title, state, saved: text, dirty: false, readonly, mtime, _sub: sub });
         self.active = self.tabs.len() - 1;
     }
 
-    fn open_file(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open (or focus) a file; `line` is 0-based and moves the cursor there.
+    fn open_file(&mut self, rel: String, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(i) = self.tabs.iter().position(|t| t.key == rel) {
             self.active = i;
+            self.goto_line(i, line, window, cx);
             return cx.notify();
         }
         let r = rel.clone();
-        self.bg(window, cx, move |t| t.read(&r), move |this, res, w, cx| match res {
-            Ok(text) => {
-                let title = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-                let ext = rel.rsplit_once('.').map(|x| x.1).unwrap_or("text").to_string();
-                this.new_tab(rel, title, text, false, ext, w, cx);
-            }
-            Err(e) => this.set_msg(format!("error: open {rel}: {e}")),
-        });
+        self.bg(
+            window,
+            cx,
+            move |t| t.read(&r).map(|x| (x, t.mtimes(&[r]).ok().and_then(|m| m[0]))),
+            move |this, res, w, cx| match res {
+                Ok((text, mtime)) => {
+                    let title = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+                    let ext = rel.rsplit_once('.').map(|x| x.1).unwrap_or("text").to_string();
+                    this.new_tab(rel, title, text, false, ext, mtime, w, cx);
+                    // TODO(lsp): attach the language server for `this.tabs[this.active]` here.
+                    this.goto_line(this.active, line, w, cx);
+                }
+                Err(e) => this.set_msg(format!("error: open {rel}: {e}")),
+            },
+        );
+    }
+
+    fn goto_line(&mut self, i: usize, line: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(l), Some(t)) = (line, self.tabs.get(i)) {
+            t.state.update(cx, |s, cx| s.set_cursor_position(Position::new(l, 0), window, cx));
+        }
     }
 
     fn open_diff(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -200,7 +270,7 @@ impl Redit {
         self.bg(window, cx, move |t| t.git_diff(&r), move |this, res, w, cx| match res {
             Ok(d) => {
                 let d = if d.trim().is_empty() { "(no diff)".to_string() } else { d };
-                this.new_tab(key.clone(), key, d, true, "diff".into(), w, cx);
+                this.new_tab(key.clone(), key, d, true, "diff".into(), None, w, cx);
             }
             Err(e) => this.set_msg(format!("error: diff {rel}: {e}")),
         });
@@ -213,9 +283,11 @@ impl Redit {
         }
         let (key, text) = (tab.key.clone(), tab.state.read(cx).text().to_string());
         let (k, t2) = (key.clone(), text.clone());
-        self.bg(window, cx, move |t| t.write(&k, &t2), move |this, res, w, cx| match res {
-            Ok(()) => {
+        let job = move |t: Target| t.write(&k, &t2).map(|_| t.mtimes(&[k]).ok().and_then(|m| m[0]));
+        self.bg(window, cx, job, move |this, res, w, cx| match res {
+            Ok(mtime) => {
                 if let Some(t) = this.tabs.iter_mut().find(|t| t.key == key) {
+                    t.mtime = mtime;
                     let cur = t.state.read(cx).text().to_string();
                     t.dirty = cur != text;
                     t.saved = text;
@@ -271,6 +343,118 @@ impl Redit {
         self.git_op("commit", window, cx, move |t| t.git_commit_all(&m));
     }
 
+    fn run_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let q = self.search_input.read(cx).value().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.set_msg(format!("searching {q}..."));
+        self.bg(window, cx, move |t| t.search(&q), |this, res, _, _| match res {
+            Ok(h) => {
+                this.set_msg(format!("{} matches", h.len()));
+                this.hits = h;
+            }
+            Err(e) => this.set_msg(format!("error: search: {e}")),
+        });
+    }
+
+    /// Every 3s: stat open files + refresh git in one background job. Skipped while one is in flight.
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.polling {
+            return;
+        }
+        self.polling = true;
+        let keys: Vec<String> = self.tabs.iter().filter(|t| !t.readonly).map(|t| t.key.clone()).collect();
+        let (t, g) = (self.target.clone(), self.gen_);
+        cx.spawn_in(window, async move |this, cx| {
+            let r = cx
+                .background_spawn(async move {
+                    let m = if keys.is_empty() { Ok(vec![]) } else { t.mtimes(&keys) };
+                    (keys, m, t.git_branch().map(|b| (b, t.git_status())))
+                })
+                .await;
+            this.update_in(cx, |this, w, cx| {
+                this.polling = false;
+                if this.gen_ == g {
+                    this.apply_poll(r, w, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_poll(
+        &mut self,
+        (keys, mtimes, git): (Vec<String>, Result<Vec<Option<i64>>, String>, Option<(String, Result<Vec<(String, String)>, String>)>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match git {
+            None => (self.branch, self.status) = (None, vec![]),
+            Some((b, st)) => {
+                self.branch = Some(b);
+                if let Ok(s) = st {
+                    self.status = s;
+                }
+            }
+        }
+        let Ok(ms) = mtimes else { return };
+        for (key, m) in keys.into_iter().zip(ms) {
+            let Some(tab) = self.tabs.iter_mut().find(|t| t.key == key) else { continue };
+            let Some(m) = m else { continue };
+            if tab.mtime.replace(m).is_none_or(|o| o == m) {
+                continue;
+            }
+            if tab.dirty {
+                self.set_msg(format!("{key} changed on disk"));
+            } else {
+                self.reload_tab(key, window, cx);
+            }
+        }
+    }
+
+    fn reload_tab(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let k = key.clone();
+        self.bg(window, cx, move |t| t.read(&k), move |this, res, w, cx| {
+            let Ok(text) = res else { return };
+            let Some(tab) = this.tabs.iter_mut().find(|t| t.key == key) else { return };
+            if tab.dirty || tab.saved == text {
+                return;
+            }
+            let pos = tab.state.read(cx).cursor_position();
+            tab.saved = text.clone();
+            tab.state.update(cx, |s, cx| {
+                s.set_value(text, w, cx);
+                s.set_cursor_position(pos, w, cx);
+            });
+            this.set_msg(format!("{key} reloaded"));
+        });
+    }
+
+    fn forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let v = self.port_input.read(cx).value().to_string();
+        let (l, r) = v.trim().split_once(':').unwrap_or((v.trim(), v.trim()));
+        let (Ok(l), Ok(r)) = (l.trim().parse::<u16>(), r.trim().parse::<u16>()) else {
+            return self.set_msg("error: ports must be `port` or `local:remote`");
+        };
+        self.bg(window, cx, move |t| t.forward(l, r), move |this, res, _, _| match res {
+            Ok(f) => {
+                this.set_msg(format!("forwarding localhost:{l} -> remote:{r}"));
+                this.forwards.push(f);
+            }
+            Err(e) => this.set_msg(format!("error: forward {l}:{r}: {e}")),
+        });
+    }
+
+    fn stop_forwards(&mut self, cx: &mut Context<Self>) {
+        let fs = std::mem::take(&mut self.forwards);
+        if !fs.is_empty() {
+            cx.background_spawn(async move { fs.into_iter().for_each(Forward::stop) }).detach();
+        }
+    }
+
     fn rows(&self, parent: &str, depth: usize, out: &mut Vec<(String, bool, usize, bool)>) {
         for e in self.dirs.get(parent).into_iter().flatten() {
             let p = join(parent, &e.name);
@@ -306,11 +490,51 @@ impl Render for Redit {
                         if is_dir {
                             this.click_dir(path.clone(), w, cx)
                         } else {
-                            this.open_file(path.clone(), w, cx)
+                            this.open_file(path.clone(), None, w, cx)
                         }
                     }))
             }),
         );
+
+        let mut prev = "";
+        let mut hit_rows = vec![];
+        for (i, h) in self.hits.iter().enumerate() {
+            if h.path != prev {
+                prev = &h.path;
+                hit_rows.push(div().id(("hf", i)).px_2().pt_2().text_xs().text_color(muted).truncate().child(h.path.clone()));
+            }
+            let mut txt: String = h.text.trim().chars().take(100).collect();
+            if h.text.trim().chars().count() > 100 {
+                txt.push('…');
+            }
+            let (p, l) = (h.path.clone(), h.line);
+            hit_rows.push(
+                div()
+                    .id(("hit", i))
+                    .pl(px(14.0))
+                    .py(px(1.0))
+                    .text_xs()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child(format!("{l}: {txt}"))
+                    .on_click(cx.listener(move |this, _, w, cx| this.open_file(p.clone(), Some(l.saturating_sub(1)), w, cx))),
+            );
+        }
+        let search = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(div().p_2().child(Input::new(&self.search_input)))
+            .child(div().id("hits").flex_1().min_h_0().overflow_y_scroll().children(hit_rows));
+        let mode = self.search_mode;
+        let side_tab = |id: &'static str, label: &'static str, on: bool, m: bool| {
+            Button::new(id).small().label(label).when(on, |b| b.primary()).on_click(cx.listener(move |this, _, _, cx| {
+                this.search_mode = m;
+                cx.notify();
+            }))
+        };
 
         let tabs = div().flex().flex_row().border_b_1().border_color(border).overflow_x_hidden().children(
             self.tabs.iter().enumerate().map(|(i, t)| {
@@ -349,7 +573,7 @@ impl Render for Redit {
         };
 
         let git = {
-            let panel = div().w(px(280.0)).flex().flex_col().border_l_1().border_color(border).p_2().gap_2();
+            let panel = div().flex_1().min_h_0().flex().flex_col().p_2().gap_2();
             match self.branch.clone() {
                 None => panel.text_color(muted).text_sm().child("Git: not a repository"),
                 Some(b) => panel
@@ -391,7 +615,7 @@ impl Render for Redit {
                                     .child(format!("{xy} {p}"))
                                     .on_click(cx.listener(move |this, _, w, cx| {
                                         if untracked {
-                                            this.open_file(p2.clone(), w, cx)
+                                            this.open_file(p2.clone(), None, w, cx)
                                         } else {
                                             this.open_diff(p2.clone(), w, cx)
                                         }
@@ -402,11 +626,53 @@ impl Render for Redit {
             }
         };
 
+        let ports = matches!(self.target, Target::Ssh { .. }).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .border_t_1()
+                .border_color(border)
+                .child(div().text_sm().child("Ports"))
+                .child(
+                    div().flex().flex_row().gap_1()
+                        .child(div().flex_1().child(Input::new(&self.port_input)))
+                        .child(Button::new("fwd").small().label("Forward").on_click(cx.listener(|this, _, w, cx| this.forward(w, cx)))),
+                )
+                .children(self.forwards.iter().enumerate().map(|(i, f)| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .items_center()
+                        .text_xs()
+                        .child(div().flex_1().truncate().child(format!("localhost:{} → remote:{}", f.local, f.remote)))
+                        .child(Button::new(("stop", i)).small().label("Stop").on_click(cx.listener(move |this, _, _, cx| {
+                            if i < this.forwards.len() {
+                                let f = this.forwards.remove(i);
+                                cx.background_spawn(async move { f.stop() }).detach();
+                            }
+                            cx.notify();
+                        })))
+                }))
+        });
+        let git = div().w(px(280.0)).flex().flex_col().border_l_1().border_color(border).child(git).children(ports);
+
         div()
             .id("root")
             .key_context("Redit")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &Save, w, cx| this.save(w, cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, w, cx| {
+                this.search_mode = true;
+                this.search_input.update(cx, |s, cx| s.focus(w, cx));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBottom, _, cx| {
+                this.bottom_open = !this.bottom_open;
+                cx.notify();
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -414,6 +680,7 @@ impl Render for Redit {
             .text_color(cx.theme().foreground)
             .child(
                 div().flex().flex_row().gap_2().p_2().border_b_1().border_color(border)
+                    .child(div().w(px(160.0)).child(Select::new(&self.host_select).placeholder("Host")))
                     .child(div().flex_1().child(Input::new(&self.target_input)))
                     .child(Button::new("open").label("Open").on_click(
                         cx.listener(|this, _, w, cx| this.open_target(w, cx)),
@@ -425,24 +692,67 @@ impl Render for Redit {
                     .min_h_0()
                     .flex()
                     .flex_row()
-                    .child(div().w(px(240.0)).flex().flex_col().border_r_1().border_color(border).child(tree))
+                    .child(
+                        div()
+                            .w(px(240.0))
+                            .flex()
+                            .flex_col()
+                            .border_r_1()
+                            .border_color(border)
+                            .child(
+                                div().flex().flex_row().gap_1().p_1()
+                                    .child(side_tab("m-files", "Files", !mode, false))
+                                    .child(side_tab("m-search", "Search", mode, true)),
+                            )
+                            .child(if mode { search.into_any_element() } else { tree.into_any_element() }),
+                    )
                     .child(div().flex_1().min_w_0().flex().flex_col().child(tabs).child(editor))
                     .child(git),
             )
+            .when(self.bottom_open, |d| {
+                d.child(
+                    div()
+                        .h(relative(0.3))
+                        .border_t_1()
+                        .border_color(border)
+                        .child(match self.bottom.clone() {
+                            Some(v) => v.into_any_element(),
+                            None => div().p_2().text_sm().child("Terminal").into_any_element(),
+                        }),
+                )
+            })
             .child(
                 div().flex().flex_row().gap_4().px_2().py_1().text_xs().text_color(muted).border_t_1().border_color(border)
                     .child(self.target.label())
                     .child(div().flex_1().truncate().child(self.msg.clone()))
-                    .when(self.busy > 0, |d| d.child("working...")),
+                    .when(self.busy > 0, |d| {
+                        d.child(if matches!(self.target, Target::Ssh { .. }) { "⟳ connecting…" } else { "working..." })
+                    }),
             )
     }
 }
 
 fn main() {
+    if std::env::var_os(target::ASKPASS_ENV).is_some() {
+        return panels::run_askpass(std::env::args().nth(1).unwrap_or_default());
+    }
     let arg = std::env::args().nth(1).unwrap_or_else(|| ".".into());
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
-        cx.bind_keys([KeyBinding::new("cmd-s", Save, None)]);
+        // gpui bindings have no `secondary-`: cmd on mac, ctrl elsewhere
+        let [save, find, term] = if cfg!(target_os = "macos") { ["cmd-s", "cmd-shift-f", "cmd-j"] } else { ["ctrl-s", "ctrl-shift-f", "ctrl-j"] };
+        cx.bind_keys([
+            KeyBinding::new(save, Save, None),
+            KeyBinding::new(find, FocusSearch, None),
+            KeyBinding::new(term, ToggleBottom, None),
+            KeyBinding::new("ctrl-`", ToggleBottom, None),
+        ]);
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
         let a = arg.clone();
         gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
