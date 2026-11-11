@@ -4,12 +4,15 @@ mod terminal;
 mod target;
 
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable,
+    ActiveTheme, Disableable, Icon, Selectable, StyledExt, Sizable, Theme, TitleBar,
     button::{Button, ButtonVariants},
+    kbd::Kbd,
+    spinner::Spinner,
     input::{Editor, EditorState, Input, InputEvent, InputState, Position},
     select::{Select, SelectEvent, SelectState},
 };
 use gpui_kit::*;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -99,6 +102,7 @@ impl Redit {
             }
         })
         .detach();
+        cx.observe_window_appearance(window, |_, w, cx| Theme::sync_system_appearance(Some(w), cx)).detach();
         let mut s = Self {
             target: Target::parse(&arg),
             lsp: lsp::LspHandle::new(Target::parse(&arg)),
@@ -491,25 +495,65 @@ impl Redit {
     }
 }
 
+/// Row height shared by every list (tree, search hits, changes) so the panels line up.
+const ROW_H: Pixels = px(24.0);
+/// Height of panel header strips (sidebar, tab bar, bottom panel) so their bottom borders align.
+const HEADER_H: Pixels = px(34.0);
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn dir_name(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
 impl Render for Redit {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let th = cx.theme();
-        let (border, muted, hover) = (th.border, th.muted_foreground, th.accent);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let th = cx.theme().clone();
+        let (border, muted, hover) = (th.border, th.muted_foreground, th.sidebar_accent);
+        let icon = |name: IconName, color: Hsla| Icon::new(name).size_3p5().flex_shrink_0().text_color(color);
+        let header = |label: &'static str| {
+            div()
+                .h(HEADER_H)
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .text_xs()
+                .font_semibold()
+                .text_color(muted)
+                .child(div().flex_1().child(label))
+        };
+        let active_key = self.tabs.get(self.active).map(|t| t.key.clone());
+
         let mut rows = vec![];
         self.rows("", 0, &mut rows);
-
-        let tree = div().id("tree").flex_1().min_h_0().overflow_y_scroll().children(
+        let tree = div().id("tree").flex_1().min_h_0().overflow_y_scroll().pb_2().children(
             rows.into_iter().enumerate().map(|(i, (path, is_dir, depth, open))| {
-                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-                let icon = if is_dir { if open { "v " } else { "> " } } else { "  " };
+                let current = active_key.as_deref() == Some(path.as_str());
+                let chevron = if open { IconName::ChevronDown } else { IconName::ChevronRight };
+                let kind = match (is_dir, open) {
+                    (true, true) => IconName::FolderOpen,
+                    (true, false) => IconName::Folder,
+                    _ => IconName::File,
+                };
                 div()
                     .id(("row", i))
-                    .pl(px(8.0 + 12.0 * depth as f32))
-                    .py(px(2.0))
+                    .h(ROW_H)
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .pl(px(10.0 + 14.0 * depth as f32))
+                    .pr_2()
                     .text_sm()
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
-                    .child(format!("{icon}{name}"))
+                    .when(current, |d| d.bg(th.sidebar_accent).text_color(th.sidebar_accent_foreground))
+                    .child(if is_dir { icon(chevron, muted).into_any_element() } else { div().w(px(14.0)).into_any_element() })
+                    .child(icon(kind, muted))
+                    .child(div().truncate().child(file_name(&path).to_string()))
                     .on_click(cx.listener(move |this, _, w, cx| {
                         if is_dir {
                             this.click_dir(path.clone(), w, cx)
@@ -525,154 +569,273 @@ impl Render for Redit {
         for (i, h) in self.hits.iter().enumerate() {
             if h.path != prev {
                 prev = &h.path;
-                hit_rows.push(div().id(("hf", i)).px_2().pt_2().text_xs().text_color(muted).truncate().child(h.path.clone()));
+                hit_rows.push(
+                    div()
+                        .id(("hf", i))
+                        .h(ROW_H)
+                        .mt_1()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .px_3()
+                        .text_sm()
+                        .child(icon(IconName::File, muted))
+                        .child(div().flex_shrink_0().font_medium().child(file_name(&h.path).to_string()))
+                        .child(div().truncate().text_xs().text_color(muted).child(dir_name(&h.path).to_string())),
+                );
             }
-            let mut txt: String = h.text.trim().chars().take(100).collect();
-            if h.text.trim().chars().count() > 100 {
-                txt.push('…');
-            }
+            let txt: String = h.text.trim().chars().take(200).collect();
             let (p, l) = (h.path.clone(), h.line);
             hit_rows.push(
                 div()
                     .id(("hit", i))
-                    .pl(px(14.0))
-                    .py(px(1.0))
+                    .h(ROW_H)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl(px(32.0))
+                    .pr_3()
                     .text_xs()
-                    .truncate()
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
-                    .child(format!("{l}: {txt}"))
+                    .child(div().w(px(28.0)).flex_shrink_0().text_right().text_color(muted).child(l.to_string()))
+                    .child(div().truncate().font_family(th.mono_font_family.clone()).child(txt))
                     .on_click(cx.listener(move |this, _, w, cx| this.open_file(p.clone(), Some(l.saturating_sub(1)), w, cx))),
             );
         }
+        let search_empty = self.hits.is_empty().then(|| {
+            div().px_3().py_2().text_xs().text_color(muted).child("Press Enter to search the workspace.")
+        });
         let search = div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .child(div().p_2().child(Input::new(&self.search_input)))
-            .child(div().id("hits").flex_1().min_h_0().overflow_y_scroll().children(hit_rows));
+            .child(div().px_2().pb_2().child(Input::new(&self.search_input).small().prefix(icon(IconName::Search, muted))))
+            .children(search_empty)
+            .child(div().id("hits").flex_1().min_h_0().overflow_y_scroll().pb_2().children(hit_rows));
+
         let mode = self.search_mode;
-        let side_tab = |id: &'static str, label: &'static str, on: bool, m: bool| {
-            Button::new(id).small().label(label).when(on, |b| b.primary()).on_click(cx.listener(move |this, _, _, cx| {
+        let mode_btn = |id: &'static str, name: IconName, tip: &'static str, on: bool, m: bool| {
+            Button::new(id).ghost().xsmall().icon(name).selected(on).tooltip(tip).on_click(cx.listener(move |this, _, _, cx| {
                 this.search_mode = m;
                 cx.notify();
             }))
         };
+        let sidebar = div()
+            .w(px(248.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(th.sidebar)
+            .text_color(th.sidebar_foreground)
+            .border_r_1()
+            .border_color(th.sidebar_border)
+            .child(
+                header(if mode { "Search" } else { "Explorer" })
+                    .child(mode_btn("m-files", IconName::Files, "Explorer", !mode, false))
+                    .child(mode_btn("m-search", IconName::Search, "Search in files", mode, true)),
+            )
+            .child(if mode { search.into_any_element() } else { tree.into_any_element() });
 
-        let tabs = div().flex().flex_row().border_b_1().border_color(border).overflow_x_hidden().children(
-            self.tabs.iter().enumerate().map(|(i, t)| {
+        let tabs = div()
+            .id("tabs")
+            .h(HEADER_H)
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .bg(th.tab_bar)
+            .border_b_1()
+            .border_color(border)
+            .overflow_x_scroll()
+            .children(self.tabs.iter().enumerate().map(|(i, t)| {
                 let act = i == self.active;
+                let group: SharedString = format!("tab{i}").into();
                 div()
                     .id(("tab", i))
+                    .group(group.clone())
+                    .h_full()
+                    .flex_shrink_0()
                     .flex()
-                    .flex_row()
-                    .gap_2()
-                    .px_3()
-                    .py_1()
+                    .items_center()
+                    .gap_1p5()
+                    .pl_3()
+                    .pr_1p5()
                     .text_sm()
                     .cursor_pointer()
                     .border_r_1()
                     .border_color(border)
-                    .when(act, |d| d.bg(hover))
-                    .child(format!("{}{}", if t.dirty { "● " } else { "" }, t.title))
-                    .child(div().id(("close", i)).text_color(muted).child("×").on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.tabs.remove(i);
-                            this.active = this.active.min(this.tabs.len().saturating_sub(1));
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    ))
+                    .map(|d| if act {
+                        // Active tab merges into the editor: same bg, and it covers the bar's bottom border.
+                        d.bg(th.background).text_color(th.foreground).mb(px(-1.0))
+                    } else {
+                        d.text_color(muted).hover(|s| s.text_color(th.foreground))
+                    })
+                    .child(icon(IconName::File, muted))
+                    .child(t.title.clone())
+                    .child(
+                        div()
+                            .id(("close", i))
+                            .size_5()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .hover(|s| s.bg(th.accent))
+                            .map(|d| if t.dirty {
+                                // Dirty: show a dot; it turns into the close button on hover.
+                                d.child(div().size_2().rounded_full().bg(th.foreground).group_hover(group.clone(), |s| s.invisible()))
+                                    .child(div().absolute().invisible().group_hover(group.clone(), |s| s.visible()).child(icon(IconName::Close, muted)))
+                            } else {
+                                d.child(div().when(!act, |d| d.invisible().group_hover(group.clone(), |s| s.visible())).child(icon(IconName::Close, muted)))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.tabs.remove(i);
+                                this.active = this.active.min(this.tabs.len().saturating_sub(1));
+                                cx.stop_propagation();
+                                cx.notify();
+                            })),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.active = i;
                         cx.notify();
                     }))
-            }),
-        );
+            }));
 
+        let shortcut = |label: &'static str, action: &dyn Action| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_8()
+                .child(div().text_sm().text_color(muted).child(label))
+                .children(Kbd::binding_for_action(action, None, window))
+        };
         let editor = match self.tabs.get(self.active) {
-            Some(t) => div().flex_1().min_h_0().child(Editor::new(&t.state).h_full()),
-            None => div().flex_1().flex().items_center().justify_center().text_color(muted).child("Open a file from the sidebar"),
+            Some(t) => div().flex_1().min_h_0().child(Editor::new(&t.state).appearance(false).h_full()),
+            None => div().flex_1().flex().items_center().justify_center().child(
+                div()
+                    .w(px(260.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(shortcut("Search in files", &FocusSearch))
+                    .child(shortcut("Toggle terminal", &ToggleBottom))
+                    .child(shortcut("Save file", &Save)),
+            ),
         };
 
-        let git = {
-            let panel = div().flex_1().min_h_0().flex().flex_col().p_2().gap_2();
-            match self.branch.clone() {
-                None => panel.text_color(muted).text_sm().child("Git: not a repository"),
-                Some(b) => panel
-                    .child(div().text_sm().child(format!("Git: {b}")))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_1()
-                            .child(Button::new("refresh").small().label("Refresh").on_click(
-                                cx.listener(|this, _, w, cx| this.refresh_git(w, cx)),
-                            ))
-                            .child(Button::new("pull").small().label("Pull").on_click(
-                                cx.listener(|this, _, w, cx| this.git_op("pull", w, cx, |t| t.git_pull())),
-                            ))
-                            .child(Button::new("push").small().label("Push").on_click(
-                                cx.listener(|this, _, w, cx| this.git_op("push", w, cx, |t| t.git_push())),
-                            )),
-                    )
-                    .child(Input::new(&self.commit_input))
-                    .child(
-                        Button::new("commit")
-                            .small()
-                            .primary()
-                            .label("Commit all")
-                            .disabled(self.status.is_empty())
-                            .on_click(cx.listener(|this, _, w, cx| this.commit(w, cx))),
-                    )
-                    .child(
-                        div().id("changes").flex_1().min_h_0().overflow_y_scroll().children(
-                            self.status.iter().enumerate().map(|(i, (xy, p))| {
-                                let (p2, untracked) = (p.clone(), xy == "??");
-                                div()
-                                    .id(("chg", i))
-                                    .text_xs()
-                                    .py(px(2.0))
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(hover))
-                                    .child(format!("{xy} {p}"))
-                                    .on_click(cx.listener(move |this, _, w, cx| {
-                                        if untracked {
-                                            this.open_file(p2.clone(), None, w, cx)
-                                        } else {
-                                            this.open_diff(p2.clone(), w, cx)
-                                        }
-                                    }))
-                            }),
+        let git_btn = |id: &'static str, name: IconName, tip: &'static str| Button::new(id).ghost().xsmall().icon(name).tooltip(tip);
+        let git = match self.branch.clone() {
+            None => div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(header("Source control"))
+                .child(div().px_3().text_xs().text_color(muted).child("This folder is not a git repository.")),
+            Some(b) => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(
+                    header("Source control")
+                        .child(git_btn("refresh", IconName::RefreshCw, "Refresh").on_click(cx.listener(|this, _, w, cx| this.refresh_git(w, cx))))
+                        .child(git_btn("pull", IconName::ArrowDown, "Pull").on_click(cx.listener(|this, _, w, cx| this.git_op("pull", w, cx, |t| t.git_pull()))))
+                        .child(git_btn("push", IconName::ArrowUp, "Push").on_click(cx.listener(|this, _, w, cx| this.git_op("push", w, cx, |t| t.git_push())))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .px_3()
+                        .pb_3()
+                        .child(div().flex().items_center().gap_1p5().text_sm().child(icon(IconName::GitBranch, muted)).child(div().truncate().child(b)))
+                        .child(Input::new(&self.commit_input).small())
+                        .child(
+                            Button::new("commit")
+                                .small()
+                                .primary()
+                                .w_full()
+                                .label(match self.status.len() {
+                                    0 => "Commit".to_string(),
+                                    1 => "Commit 1 change".to_string(),
+                                    n => format!("Commit {n} changes"),
+                                })
+                                .disabled(self.status.is_empty())
+                                .on_click(cx.listener(|this, _, w, cx| this.commit(w, cx))),
                         ),
+                )
+                .child(header("Changes").border_t_1().border_color(th.sidebar_border))
+                .when(self.status.is_empty(), |d| {
+                    d.child(div().px_3().text_xs().text_color(muted).child("Working tree clean."))
+                })
+                .child(
+                    div().id("changes").flex_1().min_h_0().overflow_y_scroll().pb_2().children(
+                        self.status.iter().enumerate().map(|(i, (xy, p))| {
+                            let (p2, untracked) = (p.clone(), xy == "??");
+                            let (letter, color) = match xy.trim().chars().next() {
+                                Some('?') => ("U", th.success),
+                                Some('A') => ("A", th.success),
+                                Some('D') => ("D", th.danger),
+                                Some('R') => ("R", th.info),
+                                _ => ("M", th.warning),
+                            };
+                            div()
+                                .id(("chg", i))
+                                .h(ROW_H)
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .px_3()
+                                .text_sm()
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(hover))
+                                .child(icon(IconName::File, muted))
+                                .child(div().flex_shrink_0().child(file_name(p).to_string()))
+                                .child(div().flex_1().truncate().text_xs().text_color(muted).child(dir_name(p).to_string()))
+                                .child(div().w_3().text_xs().font_semibold().text_color(color).child(letter))
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    if untracked {
+                                        this.open_file(p2.clone(), None, w, cx)
+                                    } else {
+                                        this.open_diff(p2.clone(), w, cx)
+                                    }
+                                }))
+                        }),
                     ),
-            }
+                ),
         };
 
         let ports = matches!(self.target, Target::Ssh { .. }).then(|| {
             div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .p_2()
+                .pb_3()
                 .border_t_1()
-                .border_color(border)
-                .child(div().text_sm().child("Ports"))
+                .border_color(th.sidebar_border)
+                .child(header("Ports"))
                 .child(
-                    div().flex().flex_row().gap_1()
-                        .child(div().flex_1().child(Input::new(&self.port_input)))
-                        .child(Button::new("fwd").small().label("Forward").on_click(cx.listener(|this, _, w, cx| this.forward(w, cx)))),
+                    div()
+                        .flex()
+                        .gap_1()
+                        .px_3()
+                        .child(div().flex_1().child(Input::new(&self.port_input).small()))
+                        .child(Button::new("fwd").small().outline().label("Forward").on_click(cx.listener(|this, _, w, cx| this.forward(w, cx)))),
                 )
                 .children(self.forwards.iter().enumerate().map(|(i, f)| {
                     div()
+                        .h(ROW_H)
+                        .mt_1()
                         .flex()
-                        .flex_row()
-                        .gap_2()
                         .items_center()
-                        .text_xs()
-                        .child(div().flex_1().truncate().child(format!("localhost:{} → remote:{}", f.local, f.remote)))
-                        .child(Button::new(("stop", i)).small().label("Stop").on_click(cx.listener(move |this, _, _, cx| {
+                        .gap_1p5()
+                        .px_3()
+                        .text_sm()
+                        .child(icon(IconName::Network, muted))
+                        .child(div().flex_1().truncate().child(format!("localhost:{} → {}", f.local, f.remote)))
+                        .child(Button::new(("stop", i)).ghost().xsmall().icon(IconName::Close).tooltip("Stop forwarding").on_click(cx.listener(move |this, _, _, cx| {
                             if i < this.forwards.len() {
                                 let f = this.forwards.remove(i);
                                 cx.background_spawn(async move { f.stop() }).detach();
@@ -681,7 +844,73 @@ impl Render for Redit {
                         })))
                 }))
         });
-        let git = div().w(px(280.0)).flex().flex_col().border_l_1().border_color(border).child(git).children(ports);
+        let right = div()
+            .w(px(280.0))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(th.sidebar)
+            .text_color(th.sidebar_foreground)
+            .border_l_1()
+            .border_color(th.sidebar_border)
+            .child(git)
+            .children(ports);
+
+        let remote = matches!(self.target, Target::Ssh { .. });
+        let title_bar = TitleBar::new().child(
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1p5()
+                .pr_2()
+                .child(div().w(px(180.0)).child(Select::new(&self.host_select).small().placeholder("SSH host")))
+                .child(div().w(px(420.0)).child(Input::new(&self.target_input).small().prefix(icon(if remote { IconName::Globe } else { IconName::Folder }, muted))))
+                .child(Button::new("open").small().outline().label("Open").on_click(cx.listener(|this, _, w, cx| this.open_target(w, cx)))),
+        );
+
+        let status_bar = div()
+            .h(px(24.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_4()
+            .px_3()
+            .text_xs()
+            .text_color(muted)
+            .bg(th.status_bar)
+            .border_t_1()
+            .border_color(th.status_bar_border)
+            .child(div().flex().items_center().gap_1().child(icon(if remote { IconName::Globe } else { IconName::HardDrive }, muted)).child(match &self.target {
+                // "." reads as nothing in the status bar; show the folder's real name.
+                Target::Local { root } => std::fs::canonicalize(root)
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| root.clone()),
+                t => t.label(),
+            }))
+            .children(self.branch.clone().map(|b| div().flex().items_center().gap_1().child(icon(IconName::GitBranch, muted)).child(b)))
+            .child(div().flex_1().truncate().child(self.msg.clone()))
+            .when(self.busy > 0, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(Spinner::new().xsmall().color(muted))
+                        .child(if remote { "Connecting…" } else { "Working…" }),
+                )
+            })
+            .child(
+                Button::new("term")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::SquareTerminal)
+                    .selected(self.bottom_open)
+                    .tooltip("Toggle terminal")
+                    .on_click(|_, w, cx| w.dispatch_action(ToggleBottom.boxed_clone(), cx)),
+            );
 
         div()
             .id("root")
@@ -706,59 +935,45 @@ impl Render for Redit {
             .size_full()
             .flex()
             .flex_col()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(
-                div().flex().flex_row().gap_2().p_2().border_b_1().border_color(border)
-                    .child(div().w(px(160.0)).child(Select::new(&self.host_select).placeholder("Host")))
-                    .child(div().flex_1().child(Input::new(&self.target_input)))
-                    .child(Button::new("open").label("Open").on_click(
-                        cx.listener(|this, _, w, cx| this.open_target(w, cx)),
-                    )),
-            )
+            .bg(th.background)
+            .text_color(th.foreground)
+            .child(title_bar)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_row()
+                    .child(sidebar)
                     .child(
                         div()
-                            .w(px(240.0))
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
-                            .border_r_1()
-                            .border_color(border)
-                            .child(
-                                div().flex().flex_row().gap_1().p_1()
-                                    .child(side_tab("m-files", "Files", !mode, false))
-                                    .child(side_tab("m-search", "Search", mode, true)),
-                            )
-                            .child(if mode { search.into_any_element() } else { tree.into_any_element() }),
+                            .when(!self.tabs.is_empty(), |d| d.child(tabs))
+                            .child(editor)
+                            .when(self.bottom_open, |d| {
+                                d.child(
+                                    div()
+                                        .h(relative(0.35))
+                                        .flex()
+                                        .flex_col()
+                                        .border_t_1()
+                                        .border_color(border)
+                                        .child(
+                                            header("Terminal").child(
+                                                git_btn("close-term", IconName::Close, "Close terminal")
+                                                    .on_click(|_, w, cx| w.dispatch_action(ToggleBottom.boxed_clone(), cx)),
+                                            ),
+                                        )
+                                        .child(div().flex_1().min_h_0().px_2().children(self.bottom.clone())),
+                                )
+                            }),
                     )
-                    .child(div().flex_1().min_w_0().flex().flex_col().child(tabs).child(editor))
-                    .child(git),
+                    .child(right),
             )
-            .when(self.bottom_open, |d| {
-                d.child(
-                    div()
-                        .h(relative(0.3))
-                        .border_t_1()
-                        .border_color(border)
-                        .child(match self.bottom.clone() {
-                            Some(v) => v.into_any_element(),
-                            None => div().p_2().text_sm().child("Terminal").into_any_element(),
-                        }),
-                )
-            })
-            .child(
-                div().flex().flex_row().gap_4().px_2().py_1().text_xs().text_color(muted).border_t_1().border_color(border)
-                    .child(self.target.label())
-                    .child(div().flex_1().truncate().child(self.msg.clone()))
-                    .when(self.busy > 0, |d| {
-                        d.child(if matches!(self.target, Target::Ssh { .. }) { "⟳ connecting…" } else { "working..." })
-                    }),
-            )
+            .child(status_bar)
     }
 }
 
@@ -767,15 +982,16 @@ fn main() {
         return panels::run_askpass(std::env::args().nth(1).unwrap_or_default());
     }
     let arg = std::env::args().nth(1).unwrap_or_else(|| ".".into());
-    gpui_kit::application().run(move |cx| {
+    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
         // gpui bindings have no `secondary-`: cmd on mac, ctrl elsewhere
         let [save, find, term] = if cfg!(target_os = "macos") { ["cmd-s", "cmd-shift-f", "cmd-j"] } else { ["ctrl-s", "ctrl-shift-f", "ctrl-j"] };
         cx.bind_keys([
             KeyBinding::new(save, Save, None),
             KeyBinding::new(find, FocusSearch, None),
-            KeyBinding::new(term, ToggleBottom, None),
+            // Kbd hints show the last binding for an action, so the primary one goes last.
             KeyBinding::new("ctrl-`", ToggleBottom, None),
+            KeyBinding::new(term, ToggleBottom, None),
         ]);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -785,7 +1001,12 @@ fn main() {
         .detach();
         cx.activate(true);
         let a = arg.clone();
-        gpui_kit::open_window(WindowOptions::default(), cx, move |window, cx| {
+        let opts = WindowOptions {
+            window_min_size: Some(size(px(900.0), px(560.0))),
+            ..TitleBar::window_options()
+        };
+        gpui_kit::open_window(opts, cx, move |window, cx| {
+            Theme::sync_system_appearance(Some(window), cx);
             let v = cx.new(|cx| Redit::new(a, window, cx));
             let f = v.read(cx).focus.clone();
             f.focus(window, cx);
