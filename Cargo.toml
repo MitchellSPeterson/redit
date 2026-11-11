@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 gpui-kit = { version = "0.9.1", features = ["syntect"] }
+lsp-types = { version = "0.97", features = ["proposed"] }
+serde = "1"
+serde_json = "1"
+anyhow = "1"
 
 [profile.release]
 lto = "thin"

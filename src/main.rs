@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+mod lsp;
 mod target;
 
 use gpui_kit::component::{
