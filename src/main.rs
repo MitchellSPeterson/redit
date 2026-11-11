@@ -1,5 +1,6 @@
 mod lsp;
 mod panels;
+mod terminal;
 mod target;
 
 use gpui_kit::component::{
@@ -168,6 +169,7 @@ impl Redit {
         self.active = 0;
         self.hits.clear();
         self.stop_forwards(cx);
+        self.bottom = None; // terminal belongs to the old target
         self.reload(window, cx);
     }
 
@@ -691,8 +693,14 @@ impl Render for Redit {
                 this.search_input.update(cx, |s, cx| s.focus(w, cx));
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ToggleBottom, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleBottom, w, cx| {
                 this.bottom_open = !this.bottom_open;
+                if this.bottom_open && this.bottom.is_none() {
+                    // shell() may wait on the ssh master: build the command off the UI thread.
+                    this.bg(w, cx, |t| t.shell(), |this, cmd, w, cx| {
+                        this.bottom = Some(cx.new(|cx| terminal::TerminalView::new(cmd, w, cx)).into());
+                    });
+                }
                 cx.notify();
             }))
             .size_full()
